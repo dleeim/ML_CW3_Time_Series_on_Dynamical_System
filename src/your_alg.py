@@ -3,6 +3,9 @@ from sklearn.linear_model import LinearRegression, Lasso
 from sklearn.model_selection import train_test_split
 from scipy.optimize import minimize
 from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import MultiTaskLassoCV
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 
 time = 0
 
@@ -92,42 +95,54 @@ def explorer(x_t: np.array, u_bounds: dict, timestep: int) -> np.array:
 def model_trainer(data: np.array, env: callable) -> callable:
     data_states, data_controls = data
     
+    # Select specific states (indices 1 and 8) and normalize
     selected_states = data_states[:, [1, 8], :]
     o_low, o_high = env.env_params['o_space']['low'][[1, 8]], env.env_params['o_space']['high'][[1, 8]]
     a_low, a_high = env.env_params['a_space']['low'], env.env_params['a_space']['high']
     selected_states_norm = (selected_states - o_low.reshape(1, -1, 1)) / (o_high.reshape(1, -1, 1) - o_low.reshape(1, -1, 1)) * 2 - 1
     data_controls_norm = (data_controls - a_low.reshape(1, -1, 1)) / (a_high.reshape(1, -1, 1) - a_low.reshape(1, -1, 1)) * 2 - 1
 
+    # Extract dimensions
     reps, states, n_steps = selected_states_norm.shape
     _, controls, _ = data_controls_norm.shape
     
-    X_states = selected_states_norm[:, :, :-1].reshape(-1, states)
-    X_controls = data_controls_norm[:, :, :-1].reshape(-1, controls)
-    X = np.hstack([X_states, X_controls])
-    y = selected_states_norm[:, :, 1:].reshape(-1, states)
+    # Prepare X (current state + control) and y (change in state)
+    X_states = selected_states_norm[:, :, :-1].reshape(-1, states)  # state[t]
+    X_controls = data_controls_norm[:, :, :-1].reshape(-1, controls)  # control[t]
+    X = np.hstack([X_states, X_controls])  # Inputs: [state[t], control[t]]
+    
+    # Compute changes in states as output: Δstate[t] = state[t+1] - state[t]
+    y_diff = selected_states_norm[:, :, 1:] - selected_states_norm[:, :, :-1]  # Shape: (reps, states, n_steps-1)
+    y = y_diff.reshape(-1, states)  # Shape: (reps * (n_steps-1), states)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Time series split
+    tscv = TimeSeriesSplit(n_splits=5)
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Train MultiTaskLassoCV on full data to predict changes
+    model = MultiTaskLassoCV(alphas=np.logspace(-4, 1, 50), cv=tscv, random_state=42)
+    model.fit(X_scaled, y)
 
-    # model = Lasso(alpha=0.01)
-    model = LinearRegression()
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
-    print(f"Mean Squared Error: {mse:.4f}")
-    print(f"R2 Score: {r2:.3f}")
-
+    # Define predictor for changes
     def next_state_predictor(x, u):
+        """
+        Predicts the next state given current state (x) and control (u).
+        Model predicts Δstate[t], so next state = x + Δstate[t].
+        """
         X_in = np.hstack([x, u]).reshape(1, -1)
-        y_out = model.predict(X_in)
-        return y_out.flatten()
+        X_in_scaled = scaler.transform(X_in)
+        delta_state = model.predict(X_in_scaled)  # Predicted change: Δstate[t]
+        next_state = x + delta_state.flatten()  # Next state = current state + change
+        return next_state
 
     return next_state_predictor
 
 def controller(x: np.array, f: callable, sp: callable, env: callable, u_prev: np.array,) -> np.array:
-    controller.team_names = ['Max Bloor', 'Antonio Del Rio Chanona']
-    controller.cids = ['01234567', '01234567']
+    controller.team_names = ['Donggyu Lee']
+    controller.cids = ['01560108']
 
     o_space = env.env_params['o_space']
     a_space = env.env_params['a_space']
